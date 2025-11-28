@@ -63,6 +63,7 @@ class Simulator:
         self.cc = {"ZF": 1, "SF": 0, "OF": 0}
         self.STAT = STAT_AOK
         self.logs = []
+        self.touched_addrs = set()
 
     def load_from_stdin(self):
         for line in sys.stdin:
@@ -90,6 +91,8 @@ class Simulator:
                     self.STAT = STAT_ADR
                     return
                 self.mem[addr] = b
+                base = (addr // 8) * 8
+                self.touched_addrs.add(base)
                 addr += 1
 
     def get_reg(self, r):
@@ -125,6 +128,10 @@ class Simulator:
             return
         u = mask64(val)
         self.mem[addr:addr+8] = u.to_bytes(8, "little")
+        base1 = (addr // 8) * 8
+        base2 = ((addr + 7) // 8) * 8  
+        self.touched_addrs.add(base1)
+        self.touched_addrs.add(base2)
 
     def cond_holds(self, ifun):
         ZF = self.cc["ZF"]
@@ -297,10 +304,11 @@ class Simulator:
         elif icode == I_CALL:
             rsp = self.get_reg(REG_RSP)
             valE = to_signed64(rsp) - 8
+            self.set_reg(REG_RSP, valE)
             if not self.check_mem_range(valE, 8):
                 return
             self.mem_write8(valE, valP)
-            self.set_reg(REG_RSP, valE)
+            
             self.PC = valC
 
         elif icode == I_RET:
@@ -317,10 +325,11 @@ class Simulator:
             valA = self.get_reg(rA)
             rsp = self.get_reg(REG_RSP)
             valE = to_signed64(rsp) - 8
+            self.set_reg(REG_RSP, valE)
             if not self.check_mem_range(valE, 8):
                 return
             self.mem_write8(valE, valA)
-            self.set_reg(REG_RSP, valE)
+            
             self.PC = valP
 
         elif icode == I_POPQ:
@@ -341,13 +350,17 @@ class Simulator:
         reg_dict = {name: to_signed64(self.regs[i]) for i, name in enumerate(REG_NAMES)}
         cc_dict = {k: int(v) for k, v in self.cc.items()}
         mem_dict = {}
-        for addr in range(0, MEM_SIZE, 8):
-            chunk = self.mem[addr:addr+8]
+
+        for base in sorted(self.touched_addrs):
+            if base < 0 or base + 8 > MEM_SIZE:
+                continue
+            chunk = self.mem[base:base+8]
             if len(chunk) < 8:
-                break
+                continue
             val = int.from_bytes(chunk, "little", signed=True)
             if val != 0:
-                mem_dict[str(addr)] = val
+                mem_dict[str(base)] = val
+
         return {
             "CC": cc_dict,
             "MEM": mem_dict,
@@ -355,6 +368,7 @@ class Simulator:
             "REG": reg_dict,
             "STAT": int(self.STAT)
         }
+
 
     def run(self):
         while self.STAT == STAT_AOK:
