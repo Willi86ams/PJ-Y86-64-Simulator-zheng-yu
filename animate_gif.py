@@ -6,6 +6,9 @@ from zheng import (
     MEM_SIZE,
     REG_NAMES,
     STAT_AOK,
+    STAT_HLT,
+    STAT_ADR,
+    STAT_INS,
     I_HALT, I_NOP, I_RRMOVQ, I_IRMOVQ, I_RMMOVQ, I_MRMOVQ,
     I_OPQ, I_JXX, I_CALL, I_RET, I_PUSHQ, I_POPQ,
 )
@@ -13,10 +16,17 @@ from zheng import (
 from PIL import Image, ImageDraw, ImageFont
 
 STAT_NAME = {
-    1: "AOK",
-    2: "HLT",
-    3: "ADR",
-    4: "INS",
+    STAT_AOK: "AOK",
+    STAT_HLT: "HLT",
+    STAT_ADR: "ADR",
+    STAT_INS: "INS",
+}
+
+ERROR_DESC = {
+    STAT_AOK: "OK (no error)",
+    STAT_HLT: "Program halted normally",
+    STAT_ADR: "Address error (invalid PC or memory access)",
+    STAT_INS: "Invalid instruction encoding",
 }
 
 # ============== 读 .yo 到模拟器 ==============
@@ -45,20 +55,28 @@ def load_yo_into_sim(sim: Simulator, yo_path: str):
                     continue
                 b = int(byte_str, 16)
                 if addr < 0 or addr >= MEM_SIZE:
-                    sim.STAT = 3
+                    sim.STAT = STAT_ADR
                     return
                 sim.mem[addr] = b
                 addr += 1
 
 
-def estimate_total_steps(yo_path: str, limit: int = 1000) -> int:
+def estimate_total_steps(yo_path: str, limit: int = 1000):
+    """
+    预跑一次，返回:
+      logical_steps: 在 AOK 状态下真正执行了多少 step()
+      total_display_steps: 动画里要显示多少步（如果最后是错误/HLT，会多一帧）
+      ended_stat: 预跑结束时的 STAT
+    """
     sim = Simulator()
     load_yo_into_sim(sim, yo_path)
     steps = 0
     while sim.STAT == STAT_AOK and steps < limit:
         sim.step()
         steps += 1
-    return max(steps, 1)
+    ended_stat = sim.STAT
+    total_display_steps = steps if ended_stat == STAT_AOK else steps + 1
+    return steps, total_display_steps, ended_stat
 
 # ============== 译码 ==============
 
@@ -157,7 +175,7 @@ def fetch_decode_once(sim: Simulator):
 def make_line(text, spans=None):
     """
     spans:
-      - 普通局部高亮: (start, end, (r,g,b))
+      - 局部高亮: (start, end, (r,g,b))
       - 整行着色: ("FULL", (r,g,b))
     """
     return {
@@ -174,16 +192,115 @@ def build_frame(sim: Simulator, fd_info, step_idx, total_steps, prev_pc, prev_re
         "progress": [],
     }
 
-    # --- Header ---
+    # ---------- 如果是 fetch/decode 级别的错误：单独走一条路径 ----------
+    if "error" in fd_info:
+        pc = fd_info.get("pc", sim.PC)
+        err = fd_info.get("error", "")
+
+        title = f"*** ERROR FRAME (step {step_idx}/{total_steps}) ***"
+        frame["header"].append(make_line(title, spans=[("FULL", (200, 0, 0))]))
+
+        frame["header"].append(make_line(f"PC   : {pc} (0x{pc:03x})"))
+
+        if err:
+            frame["header"].append(make_line(f"Detail: {err}"))
+
+        stat = sim.STAT
+        cc = sim.cc
+        stat_str = STAT_NAME.get(stat, str(stat))
+        desc = ERROR_DESC.get(stat, "")
+        if desc:
+            stat_line = f"STAT : {stat_str:<3} ({desc})   CC : ZF={cc['ZF']} SF={cc['SF']} OF={cc['OF']}"
+        else:
+            stat_line = f"STAT : {stat_str:<3}   CC : ZF={cc['ZF']} SF={cc['SF']} OF={cc['OF']}"
+        frame["header"].append(make_line(stat_line, spans=[("FULL", (200, 0, 0))]))
+
+        frame["header"].append(make_line("Execution stopped; cannot fetch/decode further."))
+
+        # Registers at error
+        frame["regs"].append(
+            make_line("Registers at error:",
+                      spans=[("FULL", (0, 128, 0))])
+        )
+
+        regs = sim.regs
+        if prev_regs is None:
+            prev_regs = [0] * len(REG_NAMES)
+
+        left_names = REG_NAMES[:8]
+        right_names = REG_NAMES[8:]
+        max_rows = max(len(left_names), len(right_names))
+
+        for i in range(max_rows):
+            text = ""
+            spans = []
+
+            if i < len(left_names):
+                name = left_names[i]
+                idx = i
+                val = regs[idx]
+                prev_val = prev_regs[idx]
+                seg = f"{name:>3} = {val:<4d}"
+                text += f"{seg:<34}"
+                if val != prev_val:
+                    spans.append((0, len(seg), (200, 160, 0)))
+            else:
+                text += " " * 34
+
+            if i < len(right_names):
+                name = right_names[i]
+                idx = 8 + i
+                val = regs[idx]
+                prev_val = prev_regs[idx]
+                seg = f"{name:>3} = {val:<4d}"
+                start = len(text)
+                text += f"{seg:<34}"
+                if val != prev_val:
+                    spans.append((start, start + len(seg), (200, 160, 0)))
+            else:
+                text += " " * 34
+
+            frame["regs"].append(make_line(text, spans=spans))
+
+        # Memory snapshot
+        frame["mem"].append(
+            make_line("Non-zero memory at error (first few 8-byte blocks)",
+                      spans=[("FULL", (128, 0, 128))])
+        )
+        state = sim.snapshot()
+        mem = state["MEM"]
+        if not mem:
+            frame["mem"].append(make_line("  (none)"))
+        else:
+            cnt = 0
+            for addr_str in sorted(mem.keys(), key=lambda x: int(x)):
+                val = mem[addr_str]
+                frame["mem"].append(make_line(f"  M[{addr_str:>5}] = {val}"))
+                cnt += 1
+                if cnt >= 6:
+                    break
+
+        # Progress bar
+        ratio = step_idx / total_steps
+        bar_len = 20
+        filled = max(1, int(round(ratio * bar_len)))
+        bar = "#" * filled + "-" * (bar_len - filled)
+        prog_text = f"Progress: [{bar}] {step_idx}/{total_steps}"
+        bar_start = prog_text.index("[")
+        bar_end = prog_text.index("]") + 1
+        bar_color = (200, 0, 0)
+        frame["progress"].append(
+            make_line(prog_text, spans=[(bar_start, bar_end, bar_color)])
+        )
+
+        return frame
+
+    # ---------- 正常 Fetch/Decode 帧 ----------
+
     title = f"Fetch & Decode (before exec) - Step {step_idx}/{total_steps}"
     frame["header"].append(
         make_line(title, spans=[("FULL", (0, 128, 255))])
     )
-
-    if "error" in fd_info:
-        msg = f"Error: {fd_info.get('error', '')}"
-        frame["header"].append(make_line(msg))
-        return frame
 
     pc = fd_info["pc"]
     raw = fd_info["raw_bytes"]
@@ -195,7 +312,7 @@ def build_frame(sim: Simulator, fd_info, step_idx, total_steps, prev_pc, prev_re
     valP = fd_info["valP"]
     instr_name = fd_info["instr_name"]
 
-    # PC 行，PC 跳转时整行紫蓝色
+    # PC 行
     if prev_pc is not None and pc != prev_pc and step_idx > 1:
         pc_line = f"PC   : {pc:<4d} (0x{pc:03x})   instr : {instr_name}   (from {prev_pc})"
         frame["header"].append(
@@ -205,19 +322,20 @@ def build_frame(sim: Simulator, fd_info, step_idx, total_steps, prev_pc, prev_re
         pc_line = f"PC   : {pc:<4d} (0x{pc:03x})   instr : {instr_name}"
         frame["header"].append(make_line(pc_line))
 
-    # STAT + CC 行
+    # STAT + CC 行（这里也加上错误描述，但只有非 AOK 才显示）
     stat = sim.STAT
     cc = sim.cc
     stat_str = STAT_NAME.get(stat, str(stat))
-    stat_line = f"STAT : {stat_str:<3}        CC : ZF={cc['ZF']} SF={cc['SF']} OF={cc['OF']}"
+    desc = ERROR_DESC.get(stat, "")
     if stat == STAT_AOK:
         color = (0, 150, 0)
-    elif stat == 2:
-        color = (40, 40, 200)
-    elif stat in (3, 4):
-        color = (200, 0, 0)
+        stat_line = f"STAT : {stat_str:<3}        CC : ZF={cc['ZF']} SF={cc['SF']} OF={cc['OF']}"
     else:
-        color = (180, 120, 0)
+        color = (200, 0, 0)
+        if desc:
+            stat_line = f"STAT : {stat_str:<3} ({desc})   CC : ZF={cc['ZF']} SF={cc['SF']} OF={cc['OF']}"
+        else:
+            stat_line = f"STAT : {stat_str:<3}   CC : ZF={cc['ZF']} SF={cc['SF']} OF={cc['OF']}"
     frame["header"].append(make_line(stat_line, spans=[("FULL", color)]))
 
     # icode / ifun
@@ -257,7 +375,6 @@ def build_frame(sim: Simulator, fd_info, step_idx, total_steps, prev_pc, prev_re
         text = ""
         spans = []
 
-        # 左半
         if i < len(left_names):
             name = left_names[i]
             idx = i
@@ -270,7 +387,6 @@ def build_frame(sim: Simulator, fd_info, step_idx, total_steps, prev_pc, prev_re
         else:
             text += " " * 34
 
-        # 右半
         if i < len(right_names):
             name = right_names[i]
             idx = 8 + i
@@ -321,29 +437,38 @@ def build_frame(sim: Simulator, fd_info, step_idx, total_steps, prev_pc, prev_re
 
 
 def build_all_frames(yo_path: str):
-    total_steps = estimate_total_steps(yo_path)
+    logical_steps, total_display_steps, ended_stat = estimate_total_steps(yo_path)
+
     sim = Simulator()
     load_yo_into_sim(sim, yo_path)
     if sim.STAT != STAT_AOK:
         print("加载 .yo 出错，STAT =", sim.STAT)
-        return [], total_steps
+        return [], total_display_steps, sim.STAT
 
     frames = []
     prev_pc = None
     prev_regs = None
     step_idx = 0
 
-    while sim.STAT == STAT_AOK and step_idx < total_steps:
+    # 先画所有 AOK 步骤
+    while sim.STAT == STAT_AOK and step_idx < logical_steps:
         step_idx += 1
         fd_info = fetch_decode_once(sim)
-        frame = build_frame(sim, fd_info, step_idx, total_steps, prev_pc, prev_regs)
+        frame = build_frame(sim, fd_info, step_idx, total_display_steps, prev_pc, prev_regs)
         frames.append(frame)
 
         prev_pc = sim.PC
         prev_regs = deepcopy(sim.regs)
         sim.step()
 
-    return frames, total_steps
+    # 最后一帧（HLT / ADR / INS），再画一帧
+    if sim.STAT != STAT_AOK:
+        step_idx += 1
+        fd_info = fetch_decode_once(sim)
+        frame = build_frame(sim, fd_info, step_idx, total_display_steps, prev_pc, prev_regs)
+        frames.append(frame)
+
+    return frames, total_display_steps, ended_stat
 
 # ============== 字体处理 ==============
 
@@ -385,7 +510,6 @@ def pick_monospace_font(size=16):
 def render_frame_to_image(frame, inner_width, font, bgcolor=(255, 255, 255)):
     visual_lines = []
 
-    # 顶部边框
     top_text = "┌" + "─" * inner_width + "┐"
     visual_lines.append({"text": top_text, "spans": []})
 
@@ -397,7 +521,6 @@ def render_frame_to_image(frame, inner_width, font, bgcolor=(255, 255, 255)):
             full_text = "│" + content_padded + "│"
             spans_full = []
             for span in line_spec["spans"]:
-                # 整行着色: ("FULL", (r,g,b)) 直接保留
                 if isinstance(span[0], str) and span[0] == "FULL":
                     spans_full.append(span)
                 else:
@@ -425,8 +548,8 @@ def render_frame_to_image(frame, inner_width, font, bgcolor=(255, 255, 255)):
 
     # 行距调大一点
     line_height = char_h + 6
-    margin_x = 10
-    margin_y = 10
+    margin_x = 10    # 左右边距
+    margin_y = 10    # 上下边距
 
     img_width = max_len * char_w + 2 * margin_x
     img_height = len(visual_lines) * line_height + 2 * margin_y
@@ -465,15 +588,16 @@ def render_frame_to_image(frame, inner_width, font, bgcolor=(255, 255, 255)):
 
     return img
 
-# ============== 生成 GIF（用 Pillow 保存） ==============
+# ============== 生成 GIF（最后一帧更慢） ==============
 
 def make_gif_advanced(
     yo_path: str,
     out_path: str = "y86_advanced.gif",
-    delay_sec: float = 1.2,
+    delay_sec: float = 1.0,
     repeat_per_step: int = 3,
+    error_last_factor: float = 3.0,  # 错误 / HLT 最后一帧放慢倍数
 ):
-    frames, total_steps = build_all_frames(yo_path)
+    frames, total_steps, ended_stat = build_all_frames(yo_path)
     if not frames:
         print("没有帧可渲染（可能加载失败）")
         return
@@ -497,7 +621,16 @@ def make_gif_advanced(
         print("没有可保存的帧")
         return
 
-    duration_ms = int(delay_sec * 1000)
+    base_ms = int(delay_sec * 1000)
+    durations = [base_ms] * len(pil_frames)
+
+    # 如果程序以 ADR/INS 结束，就把最后一步的所有帧放慢很多
+    if ended_stat in (STAT_ADR, STAT_INS, STAT_HLT):
+        start = max(0, len(pil_frames) - repeat_per_step)
+        slow_ms = int(base_ms * error_last_factor)
+        for i in range(start, len(pil_frames)):
+            durations[i] = slow_ms
+
     first, rest = pil_frames[0], pil_frames[1:]
     first.save(
         out_path,
@@ -505,20 +638,26 @@ def make_gif_advanced(
         append_images=rest,
         format="GIF",
         loop=0,
-        duration=duration_ms,
+        duration=durations,
     )
-    print(f"GIF 已生成: {out_path} （每帧 {duration_ms} ms, 每步重复 {repeat_per_step} 次）")
+    print(
+        f"GIF 已生成: {out_path} "
+        f"(普通帧 {base_ms} ms, 最后帧 {durations[-1]} ms, 每步重复 {repeat_per_step} 次)"
+    )
 
 # ============== main ==============
 
 def main():
-    
+    if len(sys.argv) < 2:
+        print("用法: python animate_gif.py test/prog1.yo")
+        sys.exit(1)
     yo_path = sys.argv[1]
     make_gif_advanced(
         yo_path,
         out_path="y86_advanced.gif",
-        delay_sec=0.6,      # 单帧时间（秒）
-        repeat_per_step=2,  # 每条指令重复帧数
+        delay_sec=1.0,        # 普通帧每帧 1 秒
+        repeat_per_step=2,    # 每条指令 2 帧
+        error_last_factor=3.0 # 错误/HLT 最后一帧 = 3 倍时间
     )
 
 if __name__ == "__main__":
